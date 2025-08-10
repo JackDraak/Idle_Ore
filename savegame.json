@@ -1,0 +1,26 @@
+{
+    "version": 1,
+    "resources": {
+        "ore": 150,
+        "food": 75
+    },
+    "entities": [
+        {
+            "name": "Rokhan the Bold",
+            "attributes": {
+                "strength": 8,
+                "dexterity": 5,
+                "perception": 4,
+                "charisma": 2,
+                "drive": 7,
+                "risk": 3
+            },
+            "experience": {
+                "mining": 14,
+                "exploring": 3
+            }
+        }
+    ],
+    "time": 124
+}
+
