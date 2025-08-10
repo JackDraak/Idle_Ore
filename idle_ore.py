@@ -1,13 +1,11 @@
 #!/usr/bin/env python3
 """
-idle_ore.py
-
-Idle workers with procedural generation, growth, and JSON save/load.
+idle_ore.py with death and reproduction.
 
 Controls:
   UP / DOWN : select worker
   SPACE     : manual mine with selected worker
-  s         : save game to savegame.json
+  s         : save game
   q         : quit (autosaves)
 """
 
@@ -18,12 +16,10 @@ import time
 from dataclasses import dataclass, field
 from typing import Dict, Optional
 
-# -------------------------
-# Configuration / constants
-# -------------------------
+# --- Config ---
 SAVE_FILENAME = "savegame.json"
 AUTO_TICK_SECONDS = 1.0
-XP_BASE_THRESHOLD = 10  # XP needed for level 1, threshold = XP_BASE_THRESHOLD * (level + 1)
+XP_BASE_THRESHOLD = 10
 PROGRESS_BAR_WIDTH = 12
 
 TRAITS = {
@@ -36,6 +32,11 @@ TRAITS = {
 }
 
 SPECIALIZE_LEVEL = 5
+MAX_WORKERS = 10
+REPRODUCTION_TICKS = 30
+REPRODUCTION_ORE_COST = 10
+DEATH_RATE_CONSTANT = 0.02
+MINING_SAFETY = 0.5  # base safety factor of mining job
 
 SYLLABLES = [
     "zor", "vik", "ka", "ron", "thu", "mar", "xel", "tri", "pha", "gon",
@@ -47,18 +48,15 @@ def make_name():
     name = "".join(random.choice(SYLLABLES) for _ in range(count))
     return name.capitalize()
 
-# -------------------------
-# Core classes
-# -------------------------
+# --- Classes ---
 @dataclass
 class Resource:
     name: str
     amount: int = 0
 
     def add(self, qty: int):
-        if qty <= 0:
-            return
-        self.amount += int(qty)
+        if qty > 0:
+            self.amount += int(qty)
 
     def spend(self, qty: int) -> bool:
         if self.amount >= qty:
@@ -66,11 +64,11 @@ class Resource:
             return True
         return False
 
-    def to_dict(self) -> Dict:
+    def to_dict(self):
         return {"name": self.name, "amount": int(self.amount)}
 
     @staticmethod
-    def from_dict(d: Dict):
+    def from_dict(d):
         return Resource(name=d.get("name", "Ore"), amount=int(d.get("amount", 0)))
 
 @dataclass
@@ -79,11 +77,13 @@ class Entity:
     strength: int = field(default_factory=lambda: random.randint(1, 3))
     drive: int = field(default_factory=lambda: random.randint(0, 2))
     trait_name: str = field(default_factory=lambda: random.choice(list(TRAITS.keys())))
+    risk_aversion: float = field(default_factory=lambda: random.uniform(0.3, 0.9))  # 0=reckless,1=cautious
     str_xp: float = 0.0
     dri_xp: float = 0.0
     str_level: int = 0
     dri_level: int = 0
     specialization: Optional[str] = None
+    ticks_survived: int = 0
 
     def trait(self) -> Dict:
         return TRAITS.get(self.trait_name, {})
@@ -139,31 +139,32 @@ class Entity:
             "strength": int(self.strength),
             "drive": int(self.drive),
             "trait_name": self.trait_name,
+            "risk_aversion": float(self.risk_aversion),
             "str_xp": float(self.str_xp),
             "dri_xp": float(self.dri_xp),
             "str_level": int(self.str_level),
             "dri_level": int(self.dri_level),
             "specialization": self.specialization,
+            "ticks_survived": int(self.ticks_survived),
         }
 
     @staticmethod
     def from_dict(d: Dict):
-        e = Entity(
+        return Entity(
             name=d.get("name", make_name()),
             strength=int(d.get("strength", 1)),
             drive=int(d.get("drive", 0)),
             trait_name=d.get("trait_name", random.choice(list(TRAITS.keys()))),
+            risk_aversion=float(d.get("risk_aversion", random.uniform(0.3, 0.9))),
             str_xp=float(d.get("str_xp", 0.0)),
             dri_xp=float(d.get("dri_xp", 0.0)),
             str_level=int(d.get("str_level", 0)),
             dri_level=int(d.get("dri_level", 0)),
             specialization=d.get("specialization"),
+            ticks_survived=int(d.get("ticks_survived", 0)),
         )
-        return e
 
-# -------------------------
-# Save / Load
-# -------------------------
+# --- Save / Load ---
 def make_save_state(resource: Resource, workers: list) -> Dict:
     return {
         "version": 1,
@@ -177,8 +178,7 @@ def save_game(filename: str, resource: Resource, workers: list) -> None:
     try:
         with open(filename, "w", encoding="utf-8") as f:
             json.dump(state, f, indent=2)
-    except Exception as e:
-        # If curses is active, printing might not show; swallow the error but you can log later
+    except Exception:
         pass
 
 def load_game(filename: str):
@@ -189,26 +189,18 @@ def load_game(filename: str):
         workers_data = data.get("workers", [])
         workers = [Entity.from_dict(wd) for wd in workers_data]
         return resource, workers
-    except FileNotFoundError:
-        return None
-    except Exception:
-        # If corrupted, ignore and return None
+    except (FileNotFoundError, json.JSONDecodeError):
         return None
 
-# -------------------------
-# UI helpers
-# -------------------------
+# --- UI helpers ---
 def progress_bar(curr: float, threshold: float, width: int) -> str:
     if threshold <= 0:
         return "[" + " " * width + "]"
     ratio = max(0.0, min(1.0, curr / threshold))
     filled = int(round(ratio * width))
-    bar = "[" + ("#" * filled).ljust(width) + "]"
-    return bar
+    return "[" + ("#" * filled).ljust(width) + "]"
 
-# -------------------------
-# Game loop (curses)
-# -------------------------
+# --- Game loop ---
 def game(stdscr):
     curses.curs_set(0)
     stdscr.nodelay(True)
@@ -225,13 +217,15 @@ def game(stdscr):
 
     selected = 0
     last_tick = time.monotonic()
+    death_messages = []
+    death_message_duration = 3  # seconds
     running = True
 
     while running:
         now = time.monotonic()
         key = stdscr.getch()
 
-        # Sanity check selected index
+        # Sanity checks on workers
         if not workers:
             workers = [Entity() for _ in range(4)]
             selected = 0
@@ -251,26 +245,74 @@ def game(stdscr):
             elif key == ord(" "):
                 workers[selected].manual_mine(ore)
 
+        # Auto tick
         if now - last_tick >= AUTO_TICK_SECONDS:
+            new_workers = []
             for w in workers:
-                w.auto_mine(ore)
+                # Death chance calculation
+                death_chance = (1.0 - w.risk_aversion) * (1.0 - MINING_SAFETY) * DEATH_RATE_CONSTANT
+                if random.random() < death_chance:
+                    death_messages.append((f"{w.name} died due to risky mining.", now))
+                    continue  # skip adding to new_workers -> worker dies
+                else:
+                    # survived this tick, increment ticks_survived
+                    w.ticks_survived += 1
+
+                    # reproduction if enough ticks survived and ore available, and below max workers
+                    if (w.ticks_survived >= REPRODUCTION_TICKS and
+                        ore.amount >= REPRODUCTION_ORE_COST and
+                        len(workers) + len(new_workers) < MAX_WORKERS):
+                        ore.spend(REPRODUCTION_ORE_COST)
+                        child = reproduce_worker(w)
+                        new_workers.append(child)
+                        w.ticks_survived = 0  # reset survival counter
+
+                    # normal auto mining
+                    w.auto_mine(ore)
+                    new_workers.append(w)
+
+            workers = new_workers
             last_tick = now
 
+        # Draw UI
         stdscr.erase()
-        stdscr.addstr(0, 0, "idle_ore - save/load enabled (s=save, q=quit)")
+        stdscr.addstr(0, 0, f"idle_ore with death/reproduction (s=save, q=quit)  Workers: {len(workers)}/{MAX_WORKERS}")
         stdscr.addstr(1, 0, f"Ore: {ore.amount}")
         stdscr.addstr(2, 0, "Controls: UP/DOWN select worker, SPACE manual mine, s save")
 
         base_row = 4
         for idx, w in enumerate(workers):
-            row = base_row + idx * 4
+            row = base_row + idx * 5
             sel_marker = ">" if idx == selected else " "
+            risk_pct = int(w.risk_aversion * 100)
             stdscr.addstr(row, 0, f"{sel_marker} {w.name}  Trait: {w.trait_name}  Spec: {w.specialization or '-'}")
-            stdscr.addstr(row + 1, 2, f"STR Lv:{w.str_level}  STR:{w.strength}  XP: {int(w.str_xp)}/{w.xp_threshold(w.str_level)} {progress_bar(w.str_xp, w.xp_threshold(w.str_level), PROGRESS_BAR_WIDTH)}")
-            stdscr.addstr(row + 2, 2, f"DRI Lv:{w.dri_level}  DRI:{w.drive}  XP: {int(w.dri_xp)}/{w.xp_threshold(w.dri_level)} {progress_bar(w.dri_xp, w.xp_threshold(w.dri_level), PROGRESS_BAR_WIDTH)}")
+            stdscr.addstr(row + 1, 2, f"Risk Aversion: {risk_pct}%  Ticks Survived: {w.ticks_survived}")
+            stdscr.addstr(row + 2, 2, f"STR Lv:{w.str_level}  STR:{w.strength}  XP: {int(w.str_xp)}/{w.xp_threshold(w.str_level)} {progress_bar(w.str_xp, w.xp_threshold(w.str_level), PROGRESS_BAR_WIDTH)}")
+            stdscr.addstr(row + 3, 2, f"DRI Lv:{w.dri_level}  DRI:{w.drive}  XP: {int(w.dri_xp)}/{w.xp_threshold(w.dri_level)} {progress_bar(w.dri_xp, w.xp_threshold(w.dri_level), PROGRESS_BAR_WIDTH)}")
+
+        # Show recent death messages (last 3 seconds)
+        now_sec = time.monotonic()
+        death_messages = [(msg, t) for (msg, t) in death_messages if now_sec - t < death_message_duration]
+        for i, (msg, t) in enumerate(death_messages[-3:]):
+            stdscr.addstr(base_row + len(workers)*5 + i, 0, msg)
 
         stdscr.refresh()
         time.sleep(0.02)
+
+def reproduce_worker(parent: Entity) -> Entity:
+    """Create a new Entity resembling the parent with some variation."""
+    # Inherit risk_aversion with random small mutation
+    new_risk = min(max(parent.risk_aversion + random.uniform(-0.1, 0.1), 0.0), 1.0)
+    # Trait can be inherited or random
+    new_trait = parent.trait_name if random.random() < 0.8 else random.choice(list(TRAITS.keys()))
+    child = Entity(
+        name=make_name(),
+        strength=max(1, parent.strength + random.choice([-1, 0, 1])),
+        drive=max(0, parent.drive + random.choice([-1, 0, 1])),
+        trait_name=new_trait,
+        risk_aversion=new_risk,
+    )
+    return child
 
 def main():
     curses.wrapper(game)
